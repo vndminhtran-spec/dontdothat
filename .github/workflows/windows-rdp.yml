@@ -1,56 +1,70 @@
-name: Windows Cloud RDP
+name: 🛡️ CYNET Cloud Kali Linux
 
 on:
   workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: windows-latest
-    timeout-minutes: 1000000
+  launch-kali:
+    runs-on: ubuntu-latest
+    timeout-minutes: 324000
 
     steps:
-      - name: 1. Enable Remote Desktop & Firewall
+      - name: 📦 Setup Kali Linux Engine & Web Terminal (TTYD)
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+          echo "=========================================================="
+          echo "  🛡️ INSTALLING KALI LINUX & HACKING SUITE..."
+          echo "=========================================================="
+          sudo apt-get update -y -q
+          
+          # نصب کلودفلرد
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared
+          sudo chmod +x /usr/local/bin/cloudflared
 
-      - name: 2. Create Admin Account
-        run: |
-          $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
-          New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
-          net user runneradmin Cynet@2026
+          # نصب وب‌ترمینال قدرتمند ttyd
+          sudo wget -q https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -O /usr/local/bin/ttyd
+          sudo chmod +x /usr/local/bin/ttyd
 
-      - name: 3. Install & Connect Tailscale VPN
-        env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-        run: |
-          # Download and install Tailscale silently
-          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
-          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
-          
-          # Connect to Tailscale network
-          Start-Sleep -Seconds 5
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
-          
-          Start-Sleep -Seconds 8
-          
-          # Get Tailscale IP
-          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-          
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
-          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
-          Write-Host "  Username     : CynetAdmin" -ForegroundColor Yellow
-          Write-Host "  Password     : Cynet@2026" -ForegroundColor Yellow
-          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
-          Write-Host "==================================================" -ForegroundColor Green
+          # اجرای کانتینر رسمی کالی لینوکس با دسترسی روت کامل
+          docker run -d \
+            --name cynet-kali \
+            --privileged \
+            --network host \
+            -v /root:/root \
+            kalilinux/kali-rolling \
+            tail -f /dev/null
 
-      - name: 4. Keep Server Alive (6 Hours)
+          # نصب ابزارهای اصلی کالی در پس‌زمینه
+          docker exec cynet-kali apt-get update -y
+          docker exec cynet-kali apt-get install -y -q nmap metasploit-framework sqlmap hydra curl wget python3 git sudo zsh tmux
+
+      - name: 🌐 Launch Interactive Web Terminal & Public Link
         run: |
-          for ($i = 1; $i -le 1000000; $i++) {
-            Start-Sleep -Seconds 60
-            Write-Host "[$i/1000000] Server running..."
-          }
+          echo "=========================================================="
+          echo "  🎉 LAUNCHING INTERACTIVE KALI WEB TERMINAL..."
+          echo "=========================================================="
+          
+          # اجرای وب ترمینال با فلگ -W برای فعال‌سازی کامل تایپ و کیبورد
+          ttyd -W -p 7681 -t fontSize=16 -t theme='{"background": "#0f172a", "foreground": "#38bdf8", "cursor": "#38bdf8"}' docker exec -it cynet-kali /bin/bash > /dev/null 2>&1 &
+          sleep 3
+
+          # ایجاد تانل کلودفلر
+          cloudflared tunnel --url http://localhost:7681 > tunnel.log 2>&1 &
+          
+          sleep 5
+          for i in {1..20}; do
+            URL=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' tunnel.log | head -n 1)
+            if [ -n "$URL" ]; then
+              echo ""
+              echo "=========================================================="
+              echo "  🔥 YOUR INTERACTIVE KALI LINUX IS LIVE & READY!"
+              echo "  👉 CLICK TO OPEN IN BROWSER: $URL"
+              echo "  --------------------------------------------------------"
+              echo "  ⚡ Full Root Access | 1000 Mbps Internet | Keyboard Active"
+              echo "=========================================================="
+              echo ""
+              break
+            fi
+            sleep 2
+          done
+
+          tail -f tunnel.log
