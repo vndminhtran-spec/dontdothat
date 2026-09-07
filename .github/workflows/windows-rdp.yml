@@ -1,0 +1,160 @@
+# =====================================================================
+#  Windows Cloud RDP - 90-day "CHAIN" - no extra prerequisites
+# ---------------------------------------------------------------------
+#  A GitHub-hosted job can live max 6 hours and its machine dies with
+#  it. Instead of fighting that, each run HANDS THE BATON:
+#
+#    run #N  : setup (RDP + CynetAdmin + Tailscale, name "github-rdp-server")
+#              -> stays alive ~5.5 h (inside the 6 h cap)
+#              -> triggers run #N+1 via the GitHub API
+#              -> `tailscale logout`  (removes its own node, frees the name)
+#              -> ends; GitHub recycles the machine
+#    run #N+1 starts seconds later and takes over the same name ...
+#
+#  Result: the SAME Tailscale name stays reachable 24/7 for 90 days
+#  (a few minutes of downtime at each ~5.5 h handoff).
+#
+#  Prerequisites: exactly the same as before
+#    - this repo + the TAILSCALE_AUTHKEY secret
+#    - the auth key must allow "use more than once / multiple devices"
+#      (it is consumed by every run in the chain)
+#  Stop early: run the separate "Windows RDP - STOP" workflow.
+#  Cost: ~335 min x ~390 runs ~= 130,000 runner-minutes over 90 days.
+#    Public repo  : free (unlimited hosted minutes)
+#    Private repo : needs Enterprise plan, or the chain pauses when
+#                   your monthly minutes run out.
+# =====================================================================
+name: Windows Cloud RDP (90d chain)
+
+on:
+  workflow_dispatch:
+    inputs:
+      deadline:
+        description: "Chain end time, UTC (empty = now + 90 days), e.g. 2026-12-07T00:00:00Z"
+        type: string
+        default: ""
+
+concurrency:
+  group: windows-rdp-chain
+  cancel-in-progress: false
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 350          # hard cap is 360; keep a safety margin
+    permissions:
+      actions: write              # needed to trigger/cancel runs
+    env:
+      DEADLINE_IN: ${{ github.event.inputs.deadline }}
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.run_id }}
+      REF: ${{ github.ref_name }}
+
+    steps:
+      - name: 1. Resolve chain deadline
+        run: |
+          $in = [string]::Trim($env:DEADLINE_IN)
+          if ($in -eq "") {
+            $d = (Get-Date).AddDays(90)
+            Write-Host "No deadline given -> now + 90 days"
+          } else {
+            try { $d = [datetime]::Parse($in) }
+            catch { $d = [datetime]::ParseExact($in, "yyyy-MM-ddTHH:mm:ssZ", [System.Globalization.CultureInfo]::InvariantCulture) }
+          }
+          $iso = $d.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+          $iso | Out-File -FilePath "$env:GITHUB_WORKSPACE/.deadline" -Encoding ascii -NoNewline
+          Write-Host "Chain runs until: $iso (UTC)"
+
+      - name: 2. Cancel sibling runs (prevents double chains)
+        run: |
+          $h = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = "application/vnd.github+json" }
+          $base = "https://api.github.com/repos/$env:REPO"
+          $runs = Invoke-RestMethod -Uri "$base/actions/runs?status=in_progress,queued&per_page=100" -Headers $h
+          foreach ($r in $runs.workflow_runs) {
+            if ([string]$r.id -ne [string]$env:RUN_ID) {
+              Write-Host "Cancelling sibling run $($r.id) ($($r.name))"
+              Invoke-RestMethod -Method Post -Uri "$base/actions/runs/$($r.id)/cancel" -Headers $h | Out-Null
+            }
+          }
+
+      - name: 3. Enable Remote Desktop & Firewall
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+
+      - name: 4. Create Admin Account
+        run: |
+          $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
+          New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
+          net user runneradmin Cynet@2026
+
+      - name: 5. Install & Connect Tailscale (same name every time)
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
+          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
+          Start-Sleep -Seconds 5
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
+          Start-Sleep -Seconds 8
+          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "  >>> RDP SERVER IS READY (this run) <<<" -ForegroundColor Cyan
+          Write-Host "  Tailscale name : github-rdp-server" -ForegroundColor Yellow
+          Write-Host "  Tailscale IP   : $ts_ip" -ForegroundColor Yellow
+          Write-Host "  Username       : CynetAdmin" -ForegroundColor Yellow
+          Write-Host "  Password       : Cynet@2026" -ForegroundColor Yellow
+          Write-Host "  >> mstsc -> github-rdp-server.<your-tailnet>.ts.net" -ForegroundColor Magenta
+          Write-Host "  >> (the IP above belongs to THIS run only)" -ForegroundColor Magenta
+          Write-Host "==================================================" -ForegroundColor Green
+
+      - name: 6. Keep alive (~5.5 h, inside the 6 h cap)
+        run: |
+          $deadline = [datetime]::ParseExact((Get-Content "$env:GITHUB_WORKSPACE/.deadline").Trim(), "yyyy-MM-ddTHH:mm:ssZ", [System.Globalization.CultureInfo]::InvariantCulture)
+          $maxEnd = (Get-Date).AddMinutes(330)
+          $end = if ($deadline -lt $maxEnd) { $deadline } else { $maxEnd }
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          $i = 0
+          while ((Get-Date) -lt $end) {
+            Start-Sleep -Seconds 300
+            $i++
+            $ip = & $ts ip -4 2>$null
+            if ($ip) {
+              Write-Host "[$i] $(Get-Date -Format 'yyyy-MM-dd HH:mm') UTC - ONLINE  ip=$ip"
+            } else {
+              Write-Host "[$i] $(Get-Date -Format 'yyyy-MM-dd HH:mm') UTC - OFFLINE, reconnecting..." -ForegroundColor Red
+              & $ts up --hostname="github-rdp-server" 2>&1 | Out-Host
+            }
+          }
+          Write-Host "Keep-alive phase finished at $(Get-Date -Format 'yyyy-MM-dd HH:mm') UTC"
+
+      - name: 7. Hand off to the next run (the chain)
+        run: |
+          $h = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = "application/vnd.github+json" }
+          $base = "https://api.github.com/repos/$env:REPO"
+          $deadlineIso = (Get-Content "$env:GITHUB_WORKSPACE/.deadline").Trim()
+          $deadline = [datetime]::ParseExact($deadlineIso, "yyyy-MM-ddTHH:mm:ssZ", [System.Globalization.CultureInfo]::InvariantCulture)
+
+          if ((Get-Date) -ge $deadline) {
+            Write-Host "Deadline reached - the chain ends here." -ForegroundColor Yellow
+            & "C:\Program Files\Tailscale\tailscale.exe" logout
+            exit 0
+          }
+
+          $payload = @{ ref = $env:REF; inputs = @{ deadline = $deadlineIso } } | ConvertTo-Json -Depth 5
+          try {
+            Invoke-RestMethod -Method Post -Uri "$base/actions/workflows/windows-rdp.yml/dispatches" -Headers $h -Body $payload -ContentType "application/json" | Out-Null
+            Write-Host "Next run triggered - it starts right after this one ends." -ForegroundColor Cyan
+          } catch {
+            Write-Host "FAILED to trigger the next run: $_" -ForegroundColor Red
+            Write-Host "Chain is broken - press 'Run workflow' again to resume." -ForegroundColor Red
+            exit 1
+          }
+
+          # Remove our node from the tailnet so the successor
+          # can take over the same name "github-rdp-server"
+          & "C:\Program Files\Tailscale\tailscale.exe" logout
+          Write-Host "Handed off. This run is done." -ForegroundColor Green
