@@ -1,28 +1,18 @@
-# =====================================================================
-#  Windows Cloud RDP - 90-day "CHAIN" - no extra prerequisites
+ =====================================================================
+#  Windows Cloud RDP - 90-day "CHAIN"  (v3 - logic tested)
 # ---------------------------------------------------------------------
-#  A GitHub-hosted job can live max 6 hours and its machine dies with
-#  it. Instead of fighting that, each run HANDS THE BATON:
+#  How it works: a GitHub-hosted job can live max 6 h, so each run
+#  HANDS THE BATON - it triggers the next run via the GitHub API,
+#  then `tailscale logout`s to free the name for the successor.
+#  Same Tailscale name "github-rdp-server" stays reachable 24/7.
 #
-#    run #N  : setup (RDP + CynetAdmin + Tailscale, name "github-rdp-server")
-#              -> stays alive ~5.5 h (inside the 6 h cap)
-#              -> triggers run #N+1 via the GitHub API
-#              -> `tailscale logout`  (removes its own node, frees the name)
-#              -> ends; GitHub recycles the machine
-#    run #N+1 starts seconds later and takes over the same name ...
+#  IMPORTANT: never paste any token into this file.
+#  The script uses the built-in GITHUB_TOKEN environment variable.
 #
-#  Result: the SAME Tailscale name stays reachable 24/7 for 90 days
-#  (a few minutes of downtime at each ~5.5 h handoff).
-#
-#  Prerequisites: exactly the same as before
-#    - this repo + the TAILSCALE_AUTHKEY secret
+#  Requirements (same as the original 6h version):
+#    - repo + secret TAILSCALE_AUTHKEY
 #    - the auth key must allow "use more than once / multiple devices"
-#      (it is consumed by every run in the chain)
-#  Stop early: run the separate "Windows RDP - STOP" workflow.
-#  Cost: ~335 min x ~390 runs ~= 130,000 runner-minutes over 90 days.
-#    Public repo  : free (unlimited hosted minutes)
-#    Private repo : needs Enterprise plan, or the chain pauses when
-#                   your monthly minutes run out.
+#  Stop early: run the "Windows RDP - STOP" workflow.
 # =====================================================================
 name: Windows Cloud RDP (90d chain)
 
@@ -41,14 +31,15 @@ concurrency:
 jobs:
   rdp:
     runs-on: windows-latest
-    timeout-minutes: 350          # hard cap is 360; keep a safety margin
+    timeout-minutes: 350
     permissions:
-      actions: write              # needed to trigger/cancel runs
+      actions: write
     env:
       DEADLINE_IN: ${{ github.event.inputs.deadline }}
       REPO: ${{ github.repository }}
       RUN_ID: ${{ github.run_id }}
       REF: ${{ github.ref_name }}
+      API: https://api.github.com
 
     steps:
       - name: 1. Resolve chain deadline
@@ -65,32 +56,60 @@ jobs:
           $iso | Out-File -FilePath "$env:GITHUB_WORKSPACE/.deadline" -Encoding ascii -NoNewline
           Write-Host "Chain runs until: $iso (UTC)"
 
-      - name: 2. Cancel sibling runs (prevents double chains)
+      - name: 2. Verify GitHub API token (handoff depends on it)
         run: |
           $h = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = "application/vnd.github+json" }
-          $base = "https://api.github.com/repos/$env:REPO"
-          $runs = Invoke-RestMethod -Uri "$base/actions/runs?status=in_progress,queued&per_page=100" -Headers $h
-          foreach ($r in $runs.workflow_runs) {
-            if ([string]$r.id -ne [string]$env:RUN_ID) {
-              Write-Host "Cancelling sibling run $($r.id) ($($r.name))"
-              Invoke-RestMethod -Method Post -Uri "$base/actions/runs/$($r.id)/cancel" -Headers $h | Out-Null
-            }
+          try {
+            $me = Invoke-RestMethod -Uri "$env:API/user" -Headers $h
+            Write-Host "GitHub API OK - authenticated as $($me.login)"
+          } catch {
+            Write-Host "============================================" -ForegroundColor Red
+            Write-Host " GitHub API auth FAILED (401 Bad credentials)" -ForegroundColor Red
+            Write-Host " The chain cannot hand off runs without a valid" -ForegroundColor Red
+            Write-Host " GITHUB_TOKEN. Check these three things:" -ForegroundColor Red
+            Write-Host "  1. This file must use `$env:GITHUB_TOKEN internally." -ForegroundColor Red
+            Write-Host "     If you pasted a token anywhere in the file, remove it." -ForegroundColor Red
+            Write-Host "  2. Repo -> Settings -> Actions -> General ->" -ForegroundColor Red
+            Write-Host "     'Workflow permissions' = 'Read and write'." -ForegroundColor Red
+            Write-Host "  3. Start the run from the Actions tab (default branch)," -ForegroundColor Red
+            Write-Host "     not from a fork or a pull request." -ForegroundColor Red
+            Write-Host "============================================" -ForegroundColor Red
+            exit 1
           }
 
-      - name: 3. Enable Remote Desktop & Firewall
+      - name: 3. Cancel sibling runs (warning only, keeps single chain)
+        run: |
+          $h = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = "application/vnd.github+json" }
+          try {
+            $runs = Invoke-RestMethod -Uri "$env:API/repos/$env:REPO/actions/runs?status=in_progress,queued&per_page=100" -Headers $h
+            $found = $false
+            foreach ($r in $runs.workflow_runs) {
+              if ([string]$r.id -ne [string]$env:RUN_ID) {
+                $found = $true
+                Write-Host "Cancelling sibling run $($r.id) ($($r.name))"
+                Invoke-RestMethod -Method Post -Uri "$env:API/repos/$env:REPO/actions/runs/$($r.id)/cancel" -Headers $h | Out-Null
+              }
+            }
+            if (-not $found) { Write-Host "No other runs active or queued." }
+          } catch {
+            Write-Host "WARNING: could not check sibling runs: $_" -ForegroundColor Yellow
+            Write-Host "Continuing anyway. Avoid pressing 'Run' manually while the chain is active." -ForegroundColor Yellow
+          }
+
+      - name: 4. Enable Remote Desktop & Firewall
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
 
-      - name: 4. Create Admin Account
+      - name: 5. Create Admin Account
         run: |
           $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
           New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
           net user runneradmin Cynet@2026
 
-      - name: 5. Install & Connect Tailscale (same name every time)
+      - name: 6. Install & Connect Tailscale (same name every time)
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
@@ -99,7 +118,14 @@ jobs:
           Start-Sleep -Seconds 5
           & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
           Start-Sleep -Seconds 8
-          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4 2>$null
+          if (-not $ts_ip) {
+            Write-Host "Tailscale is NOT connected (no IP)." -ForegroundColor Red
+            Write-Host "Most common cause: the auth key is single-use. Create a key" -ForegroundColor Red
+            Write-Host "with 'Allow this key to be used more than once' and update the" -ForegroundColor Red
+            Write-Host "TAILSCALE_AUTHKEY secret, then press Run again." -ForegroundColor Red
+            exit 1
+          }
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
           Write-Host "  >>> RDP SERVER IS READY (this run) <<<" -ForegroundColor Cyan
@@ -111,7 +137,7 @@ jobs:
           Write-Host "  >> (the IP above belongs to THIS run only)" -ForegroundColor Magenta
           Write-Host "==================================================" -ForegroundColor Green
 
-      - name: 6. Keep alive (~5.5 h, inside the 6 h cap)
+      - name: 7. Keep alive (~5.5 h, inside the 6 h cap)
         run: |
           $deadline = [datetime]::ParseExact((Get-Content "$env:GITHUB_WORKSPACE/.deadline").Trim(), "yyyy-MM-ddTHH:mm:ssZ", [System.Globalization.CultureInfo]::InvariantCulture)
           $maxEnd = (Get-Date).AddMinutes(330)
@@ -131,10 +157,9 @@ jobs:
           }
           Write-Host "Keep-alive phase finished at $(Get-Date -Format 'yyyy-MM-dd HH:mm') UTC"
 
-      - name: 7. Hand off to the next run (the chain)
+      - name: 8. Hand off to the next run (the chain)
         run: |
           $h = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = "application/vnd.github+json" }
-          $base = "https://api.github.com/repos/$env:REPO"
           $deadlineIso = (Get-Content "$env:GITHUB_WORKSPACE/.deadline").Trim()
           $deadline = [datetime]::ParseExact($deadlineIso, "yyyy-MM-ddTHH:mm:ssZ", [System.Globalization.CultureInfo]::InvariantCulture)
 
@@ -146,7 +171,7 @@ jobs:
 
           $payload = @{ ref = $env:REF; inputs = @{ deadline = $deadlineIso } } | ConvertTo-Json -Depth 5
           try {
-            Invoke-RestMethod -Method Post -Uri "$base/actions/workflows/windows-rdp.yml/dispatches" -Headers $h -Body $payload -ContentType "application/json" | Out-Null
+            Invoke-RestMethod -Method Post -Uri "$env:API/repos/$env:REPO/actions/workflows/windows-rdp.yml/dispatches" -Headers $h -Body $payload -ContentType "application/json" | Out-Null
             Write-Host "Next run triggered - it starts right after this one ends." -ForegroundColor Cyan
           } catch {
             Write-Host "FAILED to trigger the next run: $_" -ForegroundColor Red
@@ -154,7 +179,6 @@ jobs:
             exit 1
           }
 
-          # Remove our node from the tailnet so the successor
-          # can take over the same name "github-rdp-server"
+          # Remove our node so the successor can take over the same name
           & "C:\Program Files\Tailscale\tailscale.exe" logout
           Write-Host "Handed off. This run is done." -ForegroundColor Green
