@@ -1,0 +1,39 @@
+# =====================================================================
+#  STOP the 90-day RDP chain immediately.
+#  Cancels the active + queued runs of "Windows Cloud RDP (90d chain)".
+#  The live machine is then recycled by GitHub within a few minutes.
+# =====================================================================
+name: Windows RDP - STOP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  stop:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel chain runs
+        env:
+          REPO: ${{ github.repository }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ME: ${{ github.run_id }}
+        run: |
+          ids=$(curl -s -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/actions/runs?status=in_progress,queued&per_page=100" \
+            | jq -r --arg me "$ME" '.workflow_runs[] | select(.id != ($me|tonumber)) | .id')
+          if [ -z "$ids" ]; then
+            echo "No active or queued chain runs. Already stopped."
+            exit 0
+          fi
+          for id in $ids; do
+            echo "Cancelling run $id ..."
+            curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/actions/runs/$id/cancel" > /dev/null
+          done
+          echo "Chain stopped."
+          echo "Note: the cancelled machine's node may stay in your Tailscale admin"
+          echo "as OFFLINE. The next 'keep' run may pick up a name suffix (e.g. -2);"
+          echo "always connect using the name/IP shown in the newest run's logs."
