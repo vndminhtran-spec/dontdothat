@@ -1,0 +1,45 @@
+# =====================================================================
+#  STOP the 90-day RDP chain immediately (v2 - logic tested).
+#  Cancels the active + queued runs of "Windows Cloud RDP (90d chain)".
+# =====================================================================
+name: Windows RDP - STOP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  stop:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel chain runs
+        env:
+          REPO: ${{ github.repository }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ME: ${{ github.run_id }}
+          API: https://api.github.com
+        run: |
+          code=$(curl -s -o /tmp/runs.json -w '%{http_code}' \
+            -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
+            "$API/repos/$REPO/actions/runs?status=in_progress,queued&per_page=100")
+          if [ "$code" != "200" ]; then
+            echo "GitHub API returned HTTP $code - cannot cancel runs."
+            echo "Body: $(cat /tmp/runs.json)"
+            echo "If 401: run it from the Actions tab (default branch), not a fork/PR,"
+            echo "and check Settings -> Actions -> Workflow permissions = Read and write."
+            exit 1
+          fi
+          ids=$(jq -r --arg me "$ME" '.workflow_runs[] | select(.id != ($me|tonumber)) | .id' /tmp/runs.json)
+          if [ -z "$ids" ]; then
+            echo "No active or queued chain runs. Already stopped."
+            exit 0
+          fi
+          for id in $ids; do
+            echo "Cancelling run $id ..."
+            curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
+              "$API/repos/$REPO/actions/runs/$id/cancel" > /dev/null
+          done
+          echo "Chain stopped."
+          echo "The live machine is recycled by GitHub within a few minutes."
