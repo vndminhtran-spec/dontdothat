@@ -53,7 +53,7 @@ jobs:
     steps:
       - name: 1. Resolve chain deadline
         run: |
-          $in = [string]::Trim($env:DEADLINE_IN)
+          $in = ([string]$env:DEADLINE_IN).Trim()
           if ($in -eq "") {
             $d = (Get-Date).AddDays(90)
             Write-Host "No deadline given -> now + 90 days"
