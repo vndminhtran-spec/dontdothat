@@ -1,5 +1,5 @@
 # =====================================================================
-#  Windows Cloud RDP - 90-day "CHAIN"  (v3 - logic tested)
+#  Windows Cloud RDP - 90-day "CHAIN"  (v3.1 - logic tested)
 # ---------------------------------------------------------------------
 #  How it works: a GitHub-hosted job can live max 6 h, so each run
 #  HANDS THE BATON - it triggers the next run via the GitHub API,
@@ -42,6 +42,45 @@ jobs:
       API: https://api.github.com
 
     steps:
+      - name: 0. Integrity check (repo file must be the v3.1 version)
+        run: |
+          $h = @{ Authorization = "Bearer $env:GITHUB_TOKEN"; Accept = "application/vnd.github.raw+json" }
+          $api = if ($env:API) { $env:API } else { "https://api.github.com" }
+          $url = "$api/repos/$env:REPO/contents/.github/workflows/windows-rdp.yml?ref=$env:REF"
+          $raw = $null
+          try {
+            $raw = Invoke-RestMethod -Uri $url -Headers $h
+          } catch {
+            Write-Host "Could not fetch the workflow file from the repo - skipping integrity check." -ForegroundColor Yellow
+            exit 0
+          }
+          $markers = @(
+            'Bearer $env:GITHUB_TOKEN',
+            'Verify GitHub API token',
+            '([string]$env:DEADLINE_IN).Trim()',
+            'Hand off to the next run'
+          )
+          $missing = @()
+          foreach ($m in $markers) {
+            if (-not ($raw -is [string] -and $raw.Contains($m))) { $missing += $m }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Host "============================================" -ForegroundColor Red
+            Write-Host " THE FILE IN YOUR REPO IS NOT THE CORRECT VERSION" -ForegroundColor Red
+            Write-Host " Missing expected parts:" -ForegroundColor Red
+            foreach ($m in $missing) { Write-Host "   - $m" -ForegroundColor Red }
+            Write-Host "" -ForegroundColor Red
+            Write-Host " Your current file sends the token WITHOUT the" -ForegroundColor Red
+            Write-Host " required 'Bearer ' prefix, so GitHub answers 401." -ForegroundColor Red
+            Write-Host "" -ForegroundColor Red
+            Write-Host " FIX: open .github/workflows/windows-rdp.yml in the" -ForegroundColor Red
+            Write-Host " repo, DELETE ALL its content, paste the ENTIRE" -ForegroundColor Red
+            Write-Host " v3.1 file (no line-by-line editing), commit, Run." -ForegroundColor Red
+            Write-Host "============================================" -ForegroundColor Red
+            exit 1
+          }
+          Write-Host "Integrity check passed - repo file is the expected version."
+
       - name: 1. Resolve chain deadline
         run: |
           $in = ([string]$env:DEADLINE_IN).Trim()
